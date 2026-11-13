@@ -19,6 +19,9 @@ cleanup_mounts() {
     if [[ -n "$SYSROOT" ]] && mountpoint -q "$SYSROOT"; then
         sudo umount "$SYSROOT" || true
     fi
+    if mountpoint -q /tmp/bionic-root; then
+        sudo umount /tmp/bionic-root || true
+    fi
 }
 trap cleanup_mounts EXIT
 
@@ -426,14 +429,27 @@ if [[ ! -f "$DEST/linker64" || ! -e "$DEST/libc.so" ]]; then
         SYSROOT=/tmp/bionic-root
         mount_image "$RAW" "$SYSROOT"
         echo "mounted system root:"
-        ls -l "$SYSROOT" | head
+        sudo ls -l "$SYSROOT" "$SYSROOT/system/bin/linker64" "$SYSROOT/system/lib64" 2>/dev/null | head -40 || true
+        # Directories in the image are not searchable by the runner user.
+        # Copy the linker, libraries and apex payloads out as root.
+        VIEW=/tmp/bionic-view
+        sudo rm -rf "$VIEW"
+        sudo mkdir -p "$VIEW"
+        for rel in bin lib64 system/bin system/lib64 system/lib system/apex apex; do
+            if sudo test -e "$SYSROOT/$rel"; then
+                sudo mkdir -p "$VIEW/$(dirname "$rel")"
+                sudo cp -a "$SYSROOT/$rel" "$VIEW/$rel"
+            fi
+        done
+        sudo chown -R "$(id -u):$(id -g)" "$VIEW"
+        SYSROOT="$VIEW"
         LINKER=""
-        if [[ -e "$SYSROOT/bin/linker64" ]]; then
+        if [[ -e "$SYSROOT/bin/linker64" || -L "$SYSROOT/bin/linker64" ]]; then
             LINKER="$SYSROOT/bin/linker64"
-        elif [[ -e "$SYSROOT/system/bin/linker64" ]]; then
+        elif [[ -e "$SYSROOT/system/bin/linker64" || -L "$SYSROOT/system/bin/linker64" ]]; then
             LINKER="$SYSROOT/system/bin/linker64"
         else
-            LINKER=$(find "$SYSROOT" -name linker64 -type f 2>/dev/null | head -1 || true)
+            LINKER=$(find "$SYSROOT" -name linker64 \( -type f -o -type l \) 2>/dev/null | head -1 || true)
         fi
         if [[ -z "$LINKER" ]]; then
             echo "linker64 is not in the system image" >&2
