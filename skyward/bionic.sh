@@ -76,23 +76,90 @@ with open(path, "rb") as f:
             continue
         start = first * sector
         length = (last - first + 1) * sector
-        if start + 0x438 + 2 > size:
+        if start + 1024 + 16 > size:
             continue
+        f.seek(start)
+        head = f.read(4)
         f.seek(start + 0x438)
         ext = f.read(2)
         f.seek(start + 1024)
-        ero = f.read(4)
-        kind = ""
-        if ext == b"\x53\xef":
+        at = f.read(4)
+        kind = "unknown"
+        if head == b"\x3a\xff\x26\xed":
+            kind = "sparse"
+        elif ext == b"\x53\xef":
             kind = "ext4"
-        elif ero == b"\xe2\xe1\xf5\xe0":
+        elif at == b"\xe2\xe1\xf5\xe0":
             kind = "erofs"
-        print(f"gpt entry {i}: {kind or 'other'} offset {start} bytes {length}", file=sys.stderr)
-        if kind and (best is None or length > best[0]):
+        elif at == b"\x10\x20\xf5\xf2":
+            kind = "f2fs"
+        print(
+            f"gpt entry {i}: {kind} offset {start} bytes {length} head {head.hex()} at1024 {at.hex()}",
+            file=sys.stderr,
+        )
+        if best is None or length > best[0]:
             best = (length, start, kind)
 if best is None:
     sys.exit(3)
-print(f"{best[1]} {best[2]}")
+print(f"{best[1]} {best[2]} {best[0]}")
+PY
+}
+
+# The API 30 system partition is an Android sparse image inside the GPT entry.
+unsparse_at() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import struct, sys
+path, offset, out_path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+RAW, FILL, DONT, CRC = 0xCAC1, 0xCAC2, 0xCAC3, 0xCAC4
+with open(path, "rb") as src, open(out_path, "wb") as out:
+    src.seek(offset)
+    hdr = src.read(28)
+    magic, major, minor, file_hdr_sz, chunk_hdr_sz, blk_sz, total_blks, total_chunks, _sum = struct.unpack("<IHHHHIIII", hdr)
+    if magic != 0xED26FF3A:
+        sys.exit(f"not a sparse image at {offset}: {hdr[:4].hex()}")
+    if file_hdr_sz > 28:
+        src.read(file_hdr_sz - 28)
+    out_size = blk_sz * total_blks
+    print(f"sparse {total_chunks} chunks, {blk_sz}*{total_blks} = {out_size} bytes", file=sys.stderr)
+    if out_size > 8 * 1024 ** 3:
+        sys.exit(f"unsparse output is {out_size} bytes")
+    for _ in range(total_chunks):
+        ch = src.read(chunk_hdr_sz)
+        if len(ch) < 12:
+            sys.exit("short chunk header")
+        ctype, _res, csz, total_sz = struct.unpack("<HHII", ch[:12])
+        data_sz = total_sz - chunk_hdr_sz
+        blen = csz * blk_sz
+        if ctype == RAW:
+            left = blen
+            while left:
+                buf = src.read(min(left, 8 << 20))
+                if not buf:
+                    sys.exit("short raw chunk")
+                out.write(buf)
+                left -= len(buf)
+            extra = data_sz - blen
+            if extra:
+                src.read(extra)
+        elif ctype == FILL:
+            fill = src.read(4)
+            if data_sz > 4:
+                src.read(data_sz - 4)
+            block = fill * (1 << 18)
+            left = blen
+            while left:
+                n = min(left, len(block))
+                out.write(block[:n])
+                left -= n
+        elif ctype == DONT:
+            out.seek(blen, 1)
+            if data_sz:
+                src.read(data_sz)
+        elif ctype == CRC:
+            src.read(data_sz)
+        else:
+            sys.exit(f"unknown sparse chunk {ctype:#x}")
+    out.truncate(out_size)
 PY
 }
 
@@ -103,12 +170,34 @@ mount_image() {
         sudo mount -o ro,loop "$image" "$point"
         return 0
     fi
-    local line off kind
+    local line off kind length fs
     line=$(partition_of "$image")
-    off=${line%% *}
-    kind=${line##* }
-    echo "mount $image offset $off as $kind on $point"
-    sudo mount -o ro,loop,offset="$off" -t "$kind" "$image" "$point"
+    read -r off kind length <<<"$line"
+    echo "mount $image offset $off as $kind ($length bytes) on $point"
+    fs="$image"
+    if [[ "$kind" == "sparse" ]]; then
+        unsparse_at "$image" "$off" /tmp/part.raw
+        file /tmp/part.raw
+        fs=/tmp/part.raw
+        kind=""
+        if debugfs -R "stat ." "$fs" 2>/dev/null | grep -q "Inode:"; then
+            sudo mount -o ro,loop "$fs" "$point"
+            return 0
+        fi
+        # Unsparse output can itself be a filesystem with a normal superblock.
+        local at
+        at=$(od -An -t x1 -N 2 -j 1080 "$fs" | tr -d ' \n')
+        if [[ "$at" == "53ef" ]]; then
+            kind=ext4
+        fi
+        off=0
+    fi
+    if [[ "$kind" != "ext4" && "$kind" != "erofs" && "$kind" != "f2fs" ]]; then
+        echo "unrecognized filesystem (kind ${kind:-empty})" >&2
+        xxd -l 64 -s "$off" "$fs" >&2 || true
+        exit 1
+    fi
+    sudo mount -o ro,loop,offset="$off" -t "$kind" "$fs" "$point"
 }
 
 # Copy a file or a symlink. A symlink to linker64 stays a symlink. Any other
