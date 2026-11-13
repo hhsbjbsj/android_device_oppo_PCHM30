@@ -1,5 +1,44 @@
+diff --git a/crates/skyward-info/src/lib.rs b/crates/skyward-info/src/lib.rs
+index 3e53f7f..d612ba9 100644
+--- a/crates/skyward-info/src/lib.rs
++++ b/crates/skyward-info/src/lib.rs
+@@ -316,10 +316,17 @@ fn kernel_release() -> Result<String> {
+ 
+ fn storage() -> Result<Storage> {
+     let link = Path::new(skyward_block::BY_NAME).join("userdata");
++    // The about page can open before the userdata link exists.
++    if !link.exists() {
++        return Ok(Storage { total: 0, free: None });
++    }
+     let dev = fs::canonicalize(&link).with_context(|| format!("resolve {}", link.display()))?;
+     let name = dev.file_name().ok_or_else(|| anyhow!("{} has no device name", dev.display()))?;
+     let sectors: u64 = parse(&read(Path::new(SYS_BLOCK).join(name).join("size"))?, "block size")?;
+-    let free = if is_mountpoint(Path::new("/data"))? { Some(free_bytes("/data")?) } else { None };
++    let free = match is_mountpoint(Path::new("/data")) {
++        Ok(true) => Some(free_bytes("/data")?),
++        _ => None,
++    };
+     Ok(Storage { total: sectors * 512, free })
+ }
+ 
+diff --git a/crates/skyward-sys/src/sleep.rs b/crates/skyward-sys/src/sleep.rs
+index 0267615..8acfdb4 100644
+--- a/crates/skyward-sys/src/sleep.rs
++++ b/crates/skyward-sys/src/sleep.rs
+@@ -60,7 +60,10 @@ pub struct Sleeper {
+ 
+ impl Sleeper {
+     pub fn start() -> Result<Sleeper> {
+-        fs::write(MEM_SLEEP, "s2idle").with_context(|| format!("write s2idle to {MEM_SLEEP}"))?;
++        // PCHM30's kernel has no mem_sleep node. The screen still has to start.
++        if let Err(e) = fs::write(MEM_SLEEP, "s2idle") {
++            eprintln!("mem_sleep left as the kernel set it: {e}");
++        }
+         let mut fds = [0; 2];
+         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+             return Err(std::io::Error::last_os_error()).context("make the sleeper's wake pipe");
 diff --git a/crates/skyward/src/main.rs b/crates/skyward/src/main.rs
-index 1a4c1f0..a7079db 100644
+index 1a4c1f0..f996358 100644
 --- a/crates/skyward/src/main.rs
 +++ b/crates/skyward/src/main.rs
 @@ -682,18 +682,35 @@ fn recovery() -> Result<()> {
@@ -63,7 +102,7 @@ index 1a4c1f0..a7079db 100644
              }
              let root = Path::new("/");
              ui::run(&cfg, &root.join(ramdisk::FONT), &root.join(ramdisk::MONO), request, Screen::Home, None)
-@@ -787,6 +814,67 @@ fn prepare(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
+@@ -787,6 +814,70 @@ fn prepare(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
      Ok(())
  }
  
@@ -73,14 +112,17 @@ index 1a4c1f0..a7079db 100644
 +fn prepare_classic(cfg: &DeviceConfig) -> Result<()> {
 +    let _ = skyward_sys::ueventd::apply();
 +    // (partition, mount point, vfat). modem is the radio firmware volume.
++    // The recovery binary and linker64 live in the ramdisk at /system.
++    // Mounting the system partition there hides them, and the next start
++    // of the service then cannot exec. Read it at /mnt/system instead.
 +    let pairs = [
-+        ("system", "/system", false),
++        ("system", "/mnt/system", false),
 +        ("vendor", "/vendor", false),
 +        ("odm", "/odm", false),
 +        ("persist", "/mnt/vendor/persist", false),
 +        ("cache", "/cache", false),
 +        ("metadata", "/metadata", false),
-+        ("modem", "/vendor/firmware_mnt", true),
++        ("modem", "/firmware", true),
 +    ];
 +    for (name, point, vfat) in pairs {
 +        let Some(device) = block_named(name) else {
@@ -131,3 +173,95 @@ index 1a4c1f0..a7079db 100644
  fn info(config: &str) -> Result<()> {
      let cfg = DeviceConfig::load(config)?;
      let i = skyward_info::collect(&cfg)?;
+diff --git a/crates/skyward/src/ui.rs b/crates/skyward/src/ui.rs
+index 3144b83..86f1ccf 100644
+--- a/crates/skyward/src/ui.rs
++++ b/crates/skyward/src/ui.rs
+@@ -50,6 +50,7 @@ use std::io::Write;
+ use std::os::unix::fs::MetadataExt;
+ use std::path::{Path, PathBuf};
+ use std::sync::{Arc, Mutex};
++use std::thread;
+ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+ 
+ /// How long init may take to hand the USB port to another function: the
+@@ -1043,6 +1044,38 @@ fn wait(fds: &[i32], timeout_ms: i32) -> Result<()> {
+     Ok(())
+ }
+ 
++/// The panel can show up a few seconds after pid 1, and not always as card0.
++fn open_surface() -> Result<KmsSurface> {
++    let start = Instant::now();
++    let mut last = String::from("no drm card");
++    loop {
++        let mut tried = false;
++        if let Ok(dir) = fs::read_dir("/dev/dri") {
++            let mut cards: Vec<_> = dir.filter_map(|e| e.ok()).map(|e| e.path()).collect();
++            cards.sort();
++            for path in cards {
++                let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
++                if !name.starts_with("card") {
++                    continue;
++                }
++                tried = true;
++                match KmsSurface::open(&path.to_string_lossy()) {
++                    Ok(surface) => return Ok(surface),
++                    Err(e) => last = format!("{name}: {e:#}"),
++                }
++            }
++        }
++        if !tried {
++            last = "no card under /dev/dri".into();
++        }
++        if start.elapsed() >= Duration::from_secs(20) {
++            return Err(anyhow!(last));
++        }
++        let _ = skyward_sys::kmsg(&format!("display not ready: {last}"));
++        thread::sleep(Duration::from_millis(500));
++    }
++}
++
+ /// Run the pages. What `request`, read from misc, asks for decides the
+ /// first of them; asking for nothing, they start at `start`.
+ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&Path>) -> Result<()> {
+@@ -1051,7 +1084,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request,
+     }
+     let mut info = skyward_info::collect(cfg)?;
+     let fonts = Fonts::load(font, 0, mono)?;
+-    let mut surface = KmsSurface::open("/dev/dri/card0")?;
++    let mut surface = open_surface()?;
+     let (w, h) = surface.size();
+     eprintln!("display {}", surface.describe());
+     let mut inputs = Inputs::open(w, h, cfg.touch.writes.clone())?;
+@@ -1060,7 +1093,15 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request,
+     // adbd and fastbootd ask over it to go over to fastboot and back.
+     let control = Control::open()?;
+     let mut haptics = cfg.haptics.as_ref().map(Haptics::open).transpose()?;
+-    let mut backlight = Backlight::open()?;
++    // The panel can already be lit by init. A missing backlight node must
++    // not drop the pages.
++    let mut backlight = match Backlight::open() {
++        Ok(light) => Some(light),
++        Err(e) => {
++            let _ = skyward_sys::kmsg(&format!("backlight not opened: {e:#}"));
++            None
++        }
++    };
+     let first = match &request.work {
+         Work::Fastboot => Screen::Fastboot,
+         Work::PromptWipeData => Screen::CantStart,
+@@ -1466,10 +1507,12 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request,
+         // After the frame is on the panel, so a panel coming back on lights
+         // with what it should show now, never with what it showed when it
+         // went off.
+-        if backlight.level == 0 && panel.is_some() {
++        if backlight.as_ref().is_some_and(|light| light.level == 0) && panel.is_some() {
+             surface.settle()?;
+         }
+-        backlight.show(panel)?;
++        if let Some(light) = backlight.as_mut() {
++            light.show(panel)?;
++        }
+         if panel.is_some() {
+             // Lit, a panel that came on again switches to its fastest
+             // refresh.

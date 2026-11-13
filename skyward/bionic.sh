@@ -64,6 +64,11 @@ if [[ ! -f "$DEST/linker64" || ! -f "$DEST/libc.so" ]]; then
     echo "system image root prefix '${ROOT}'"
     copy_elf_or_link "$RAW" "${ROOT}bin/linker64" "$DEST/linker64"
     chmod 755 "$DEST/linker64"
+    if ! file "$DEST/linker64" | grep -q ELF; then
+        echo "linker64 is not an ELF" >&2
+        file "$DEST/linker64" >&2 || true
+        exit 1
+    fi
     for lib in libc.so libm.so libdl.so liblog.so libunwind.so libc++.so libstdc++.so; do
         copy_elf_or_link "$RAW" "${ROOT}lib64/$lib" "$DEST/$lib" || echo "no $lib in the image"
     done
@@ -78,6 +83,17 @@ for src in "$NDK_LIB"/libc++_shared.so "$NDK_LIB"/libunwind.so "$NDK"/sources/cx
     fi
 done
 
+if ! file -L "$DEST/linker64" | grep -q ELF; then
+    echo "linker64 is not an ELF" >&2
+    file -L "$DEST/linker64" >&2 || true
+    exit 1
+fi
+if ! file -L "$DEST/libc.so" | grep -q ELF; then
+    echo "libc.so is not an ELF" >&2
+    file -L "$DEST/libc.so" >&2 || true
+    ls -l "$DEST" >&2 || true
+    exit 1
+fi
 echo "bionic files:"
 ls -l "$DEST"
-file "$DEST"/* || true
+file -L "$DEST"/* || true

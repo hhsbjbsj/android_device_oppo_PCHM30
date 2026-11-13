@@ -27,16 +27,11 @@ needed() {
 }
 
 cd "$SKYWARD"
+# Dynamic, the way Skyward runs in a stock ramdisk. The fully static binary
+# linked, then the phone rebooted out of recovery.
 echo "building skyward"
-set +e
-RUSTFLAGS="-C target-feature=+crt-static" cargo ndk -t arm64-v8a --platform 30 build --locked --release -p skyward
-static_rc=$?
-set -e
+cargo ndk -t arm64-v8a --platform 30 build --locked --release -p skyward
 BIN="$SKYWARD/target/aarch64-linux-android/release/skyward"
-if [[ $static_rc -ne 0 || ! -f "$BIN" ]]; then
-    echo "static skyward link failed; building it against bionic"
-    cargo ndk -t arm64-v8a --platform 30 build --locked --release -p skyward
-fi
 
 echo "building system-init"
 set +e
@@ -51,39 +46,42 @@ fi
 
 mapfile -t NEEDS < <(needed "$BIN")
 LIBS_ARGS=()
-if [[ ${#NEEDS[@]} -gt 0 ]]; then
-    echo "skyward needs: ${NEEDS[*]}"
-    bash "$DEVICE/skyward/bionic.sh" "$BIONIC" "$ANDROID_NDK_HOME"
-    LIBS="$OUT/libs"
-    rm -rf "$LIBS"
-    mkdir -p "$LIBS"
-    cp -a "$BIONIC/linker64" "$LIBS/linker64"
-    for lib in "${NEEDS[@]}"; do
-        if [[ -e "$BIONIC/$lib" ]]; then
-            cp -a "$BIONIC/$lib" "$LIBS/$lib"
-        else
-            echo "no provider for $lib" >&2
-            ls -l "$BIONIC" >&2
-            exit 1
-        fi
-    done
-    # system-init may need a library the recovery service did not.
-    mapfile -t SNEEDS < <(needed "$SINIT")
-    for lib in "${SNEEDS[@]}"; do
-        if [[ -e "$LIBS/$lib" ]]; then
-            continue
-        fi
-        if [[ -e "$BIONIC/$lib" ]]; then
-            cp -a "$BIONIC/$lib" "$LIBS/$lib"
-        else
-            echo "system-init needs $lib, which was not extracted" >&2
-            exit 1
-        fi
-    done
-    LIBS_ARGS=(--libs "$LIBS")
-else
-    echo "skyward has no DT_NEEDED entries"
+INTERP=$("$READELF" -l "$BIN" | sed -n 's/.*Requesting program interpreter: //p' | tr -d '[]' || true)
+if [[ ${#NEEDS[@]} -eq 0 && -z "$INTERP" ]]; then
+    echo "skyward linked static; that image rebooted the phone out of recovery" >&2
+    "$READELF" -d "$BIN" >&2 || true
+    exit 1
 fi
+echo "skyward interpreter: ${INTERP:-none}"
+echo "skyward needs: ${NEEDS[*]:-none}"
+bash "$DEVICE/skyward/bionic.sh" "$BIONIC" "$ANDROID_NDK_HOME"
+LIBS="$OUT/libs"
+rm -rf "$LIBS"
+mkdir -p "$LIBS"
+cp -a "$BIONIC/linker64" "$LIBS/linker64"
+for lib in "${NEEDS[@]}"; do
+    if [[ -e "$BIONIC/$lib" ]]; then
+        cp -a "$BIONIC/$lib" "$LIBS/$lib"
+    else
+        echo "no provider for $lib" >&2
+        ls -l "$BIONIC" >&2
+        exit 1
+    fi
+done
+# system-init may need a library the recovery service did not.
+mapfile -t SNEEDS < <(needed "$SINIT")
+for lib in "${SNEEDS[@]}"; do
+    if [[ -e "$LIBS/$lib" ]]; then
+        continue
+    fi
+    if [[ -e "$BIONIC/$lib" ]]; then
+        cp -a "$BIONIC/$lib" "$LIBS/$lib"
+    else
+        echo "system-init needs $lib, which was not extracted" >&2
+        exit 1
+    fi
+done
+LIBS_ARGS=(--libs "$LIBS")
 
 python3 "$DEVICE/skyward/pack.py" \
     --kernel "$DEVICE/prebuilt/kernel" \

@@ -30,7 +30,7 @@ CMDLINE = (
     "androidboot.memcg=1 lpm_levels.sleep_disabled=1 video=vfb:640x400,bpp=32,memsize=3072000 "
     "msm_rtb.filter=0x237 service_locator.enable=1 swiotlb=1 earlycon=msm_geni_serial,0x4a90000 "
     "loop.max_part=7 cgroup.memory=nokmem,nosocket buildvariant=user "
-    "androidboot.selinux=permissive enforcing=0"
+    "androidboot.selinux=permissive enforcing=0 msm_drm.modeset=1"
 )
 
 # 11.0.0 / 2022-05, the ColorOS 11 build named by the device fingerprint.
