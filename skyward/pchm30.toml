@@ -1,0 +1,28 @@
+[device]
+codename = "pchm30"
+brand = "OPPO"
+model = "OPPO A11x"
+ab = false
+soc = { hans = "骁龙 665", hant = "Snapdragon 665", en = "Snapdragon 665" }
+os_version_prop = "ro.build.display.id"
+
+[display]
+# 720x1600 at 320 dpi, 6.5 inch, as the PCHM30 device tree describes the panel.
+width = 720
+height = 1600
+density = 320
+diagonal = 6.5
+corner_radius = 36
+
+[modules]
+# The touchscreen is the in-kernel FocalTech driver. An empty load list
+# must not open modules.dep.
+sources = ["vendor"]
+load = []
+
+# Radio firmware lives on the modem partition. The non-A/B boot path mounts it.
+[firmware]
+partition = "modem"
+
+[partitions]
+mounted = ["persist"]

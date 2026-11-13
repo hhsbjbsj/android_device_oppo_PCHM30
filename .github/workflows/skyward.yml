@@ -1,0 +1,79 @@
+name: Skyward PCHM30
+
+on:
+  push:
+    branches: [main, skyward]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: skyward-pchm30-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  recovery:
+    name: Build the recovery image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout the device tree
+        uses: actions/checkout@v4
+        with:
+          path: device
+
+      - name: Checkout Skyward
+        uses: actions/checkout@v4
+        with:
+          repository: kirklin/skyward
+          ref: ff1668fdb72a46f22152a6540f49728c42081aba
+          path: skyward
+
+      - name: Patch Skyward for a phone without A/B
+        working-directory: skyward
+        run: git apply ../device/skyward/non-ab.patch
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: skyward
+
+      - name: Install the Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r29
+          add-to-path: false
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Cache Android 11 bionic
+        uses: actions/cache@v4
+        with:
+          path: bionic
+          key: bionic-arm64-api30-google-apis-r10-v1
+
+      - name: Build and pack
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: bash device/skyward/build.sh
+
+      - name: Upload the recovery image
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyward-pchm30
+          path: |
+            out/skyward-pchm30.img
+            out/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14

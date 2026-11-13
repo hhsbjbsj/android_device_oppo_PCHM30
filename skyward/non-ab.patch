@@ -1,0 +1,133 @@
+diff --git a/crates/skyward/src/main.rs b/crates/skyward/src/main.rs
+index 1a4c1f0..a7079db 100644
+--- a/crates/skyward/src/main.rs
++++ b/crates/skyward/src/main.rs
+@@ -682,18 +682,35 @@ fn recovery() -> Result<()> {
+         std::fs::create_dir_all(skyward_sys::RUN).with_context(|| format!("make {}", skyward_sys::RUN))?;
+         std::fs::set_permissions(skyward_sys::RUN, std::fs::Permissions::from_mode(0o755))
+             .with_context(|| format!("open {} to the recovery's other users", skyward_sys::RUN))?;
+-        skyward_sys::keep_log(Path::new(skyward_sys::LOG))?;
++        // A ramdisk without Android's init has no property area and may not
++        // have misc mapped yet. The screen still has to come up.
++        if let Err(e) = skyward_sys::keep_log(Path::new(skyward_sys::LOG)) {
++            let _ = skyward_sys::kmsg(&format!("log file not kept: {e:#}"));
++        }
+         // A recovery that ended with a function of its own in the port took
+         // the port with it; going through "none" takes that function off.
+-        if skyward_sys::prop("sys.usb.state").is_some_and(|s| s != "adb") {
+-            skyward_sys::usb::set("none", std::time::Duration::from_secs(5))?;
++        if let Err(e) = (|| -> Result<()> {
++            if skyward_sys::prop("sys.usb.state").is_some_and(|s| s != "adb") {
++                skyward_sys::usb::set("none", std::time::Duration::from_secs(5))?;
++            }
++            skyward_sys::set_prop("sys.usb.config", "adb")?;
++            Ok(())
++        })() {
++            let _ = skyward_sys::kmsg(&format!("usb left as the kernel opened it: {e:#}"));
+         }
+-        skyward_sys::set_prop("sys.usb.config", "adb")?;
+         let misc = bcb::misc();
+-        let message = bcb::read(&misc)?;
++        let message = match bcb::read(&misc) {
++            Ok(message) => message,
++            Err(e) => {
++                let _ = skyward_sys::kmsg(&format!("misc left unread: {e:#}"));
++                bcb::Bcb::default()
++            }
++        };
+         let request = message.request();
+         if !request.work.lasts() {
+-            bcb::clear(&misc)?;
++            if let Err(e) = bcb::clear(&misc) {
++                let _ = skyward_sys::kmsg(&format!("misc not cleared: {e:#}"));
++            }
+         }
+         let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
+         skyward_sys::kmsg(&format!(
+@@ -748,7 +765,17 @@ fn recovery() -> Result<()> {
+             // erasing them, which may take super with them, and undoing
+             // shared blocks, which writes to the slot's own.
+             if !matches!(request.work, bcb::Work::Fastboot | bcb::Work::WipeAb { .. } | bcb::Work::UnshareBlocks) {
+-                prepare(&cfg, booted_slot()?)?;
++                match booted_slot() {
++                    Ok(slot) => prepare(&cfg, slot)?,
++                    // PCHM30 and the other phones without A/B or super: the
++                    // named partitions are mounted from the GPT instead.
++                    Err(e) => {
++                        skyward_sys::kmsg(&format!("no super slot, mounting named partitions: {e:#}"))?;
++                        if let Err(e) = prepare_classic(&cfg) {
++                            skyward_sys::kmsg(&format!("named partitions not mounted: {e:#}"))?;
++                        }
++                    }
++                }
+             }
+             let root = Path::new("/");
+             ui::run(&cfg, &root.join(ramdisk::FONT), &root.join(ramdisk::MONO), request, Screen::Home, None)
+@@ -787,6 +814,67 @@ fn prepare(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
+     Ok(())
+ }
+ 
++/// Mount the GPT partitions a non-A/B phone keeps system, vendor and the
++/// radios on. One that will not mount is logged; the screen still starts.
++#[cfg(target_os = "android")]
++fn prepare_classic(cfg: &DeviceConfig) -> Result<()> {
++    let _ = skyward_sys::ueventd::apply();
++    // (partition, mount point, vfat). modem is the radio firmware volume.
++    let pairs = [
++        ("system", "/system", false),
++        ("vendor", "/vendor", false),
++        ("odm", "/odm", false),
++        ("persist", "/mnt/vendor/persist", false),
++        ("cache", "/cache", false),
++        ("metadata", "/metadata", false),
++        ("modem", "/vendor/firmware_mnt", true),
++    ];
++    for (name, point, vfat) in pairs {
++        let Some(device) = block_named(name) else {
++            let _ = skyward_sys::kmsg(&format!("{name} has no block device"));
++            continue;
++        };
++        std::fs::create_dir_all(point).with_context(|| format!("make {point}"))?;
++        let mounted = if vfat {
++            skyward_block::mount::mount(&device, Path::new(point), "vfat", &["ro".into()]).map(|()| "vfat")
++        } else {
++            skyward_block::mount::mount_ro(&device, Path::new(point)).map(|fs| fs)
++        };
++        match mounted {
++            Ok(fs) => skyward_sys::kmsg(&format!("mounted {name} on {point} ({fs})"))?,
++            Err(e) => skyward_sys::kmsg(&format!("{name} not mounted: {e:#}"))?,
++        }
++    }
++    let persist = Path::new("/mnt/vendor/persist");
++    if skyward_block::mount::is_mount_point(persist).unwrap_or(false) {
++        std::fs::create_dir_all("/persist")?;
++        if let Err(e) = skyward_block::mount::bind(persist, Path::new("/persist")) {
++            skyward_sys::kmsg(&format!("persist not shown at /persist: {e:#}"))?;
++        }
++    }
++    match load_modules(cfg, &cfg.modules.load) {
++        Ok(paths) => {
++            for path in paths {
++                skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
++            }
++        }
++        Err(e) => skyward_sys::kmsg(&format!("modules not loaded: {e:#}"))?,
++    }
++    Ok(())
++}
++
++/// The block device of a GPT partition, once init has linked by-name.
++#[cfg(target_os = "android")]
++fn block_named(name: &str) -> Option<PathBuf> {
++    for root in ["/dev/block/by-name", "/dev/block/bootdevice/by-name"] {
++        let path = Path::new(root).join(name);
++        if path.exists() {
++            return Some(path);
++        }
++    }
++    None
++}
++
+ fn info(config: &str) -> Result<()> {
+     let cfg = DeviceConfig::load(config)?;
+     let i = skyward_info::collect(&cfg)?;
