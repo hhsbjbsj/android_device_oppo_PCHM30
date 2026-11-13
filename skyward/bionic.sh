@@ -84,6 +84,8 @@ with open(path, "rb") as f:
         ext = f.read(2)
         f.seek(start + 1024)
         at = f.read(4)
+        f.seek(start + 4096)
+        geo = f.read(4)
         kind = "unknown"
         if head == b"\x3a\xff\x26\xed":
             kind = "sparse"
@@ -93,8 +95,10 @@ with open(path, "rb") as f:
             kind = "erofs"
         elif at == b"\x10\x20\xf5\xf2":
             kind = "f2fs"
+        elif geo == b"gDla":
+            kind = "super"
         print(
-            f"gpt entry {i}: {kind} offset {start} bytes {length} head {head.hex()} at1024 {at.hex()}",
+            f"gpt entry {i}: {kind} offset {start} bytes {length} head {head.hex()} at1024 {at.hex()} at4096 {geo.hex()}",
             file=sys.stderr,
         )
         if best is None or length > best[0]:
@@ -163,6 +167,78 @@ with open(path, "rb") as src, open(out_path, "wb") as out:
 PY
 }
 
+# API 30 emulator images store system inside a dynamic "super" partition.
+# Geometry magic gDla sits 4096 bytes into that partition.
+extract_logical_system() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import struct, sys
+image, super_off, out_path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+GEOMETRY = 0x616C4467
+HEADER = 0x414C5030
+with open(image, "rb") as src:
+    src.seek(super_off + 4096)
+    magic, struct_size = struct.unpack("<II", src.read(8))
+    if magic != GEOMETRY:
+        sys.exit(f"super geometry magic {magic:#x}")
+    meta = super_off + 4096 * 3
+    src.seek(meta)
+    hdr = src.read(256)
+    hmagic, major, minor, header_size = struct.unpack_from("<IHH I", hdr, 0)
+    if hmagic != HEADER:
+        sys.exit(f"lp header magic {hmagic:#x}")
+    tables_size = struct.unpack_from("<I", hdr, 44)[0]
+    def desc(at):
+        return struct.unpack_from("<III", hdr, at)
+    part_off, part_n, part_esz = desc(80)
+    ext_off, ext_n, ext_esz = desc(92)
+    src.seek(meta + header_size)
+    tables = src.read(tables_size)
+    parts = []
+    for i in range(part_n):
+        raw = tables[part_off + i * part_esz: part_off + i * part_esz + 52]
+        name, _attr, first, num, _group = struct.unpack("<36s4I", raw[:52])
+        name = name.split(b"\x00", 1)[0].decode()
+        parts.append((name, first, num))
+        print(f"lp {name} extents {num} first {first}", file=sys.stderr)
+    extents = []
+    for i in range(ext_n):
+        raw = tables[ext_off + i * ext_esz: ext_off + i * ext_esz + 24]
+        extents.append(struct.unpack("<QIQI", raw[:24]))
+    chosen = None
+    for want in ("system", "system_a"):
+        for part in parts:
+            if part[0] == want:
+                chosen = part
+                break
+        if chosen:
+            break
+    if chosen is None:
+        sys.exit("super has no system partition")
+    print(f"extracting {chosen[0]}", file=sys.stderr)
+    written = 0
+    with open(out_path, "wb") as out:
+        for n in range(chosen[2]):
+            num_sectors, target_type, target_data, _source = extents[chosen[1] + n]
+            blen = num_sectors * 512
+            if target_type == 1:
+                out.seek(blen, 1)
+            elif target_type == 0:
+                src.seek(super_off + target_data * 512)
+                left = blen
+                while left:
+                    buf = src.read(min(left, 8 << 20))
+                    if not buf:
+                        sys.exit("short system extent")
+                    out.write(buf)
+                    left -= len(buf)
+            else:
+                sys.exit(f"unsupported extent type {target_type}")
+            written += blen
+        out.truncate(written)
+    print(f"logical system {written} bytes", file=sys.stderr)
+PY
+}
+
 mount_image() {
     local image="$1" point="$2"
     sudo mkdir -p "$point"
@@ -174,6 +250,16 @@ mount_image() {
     line=$(partition_of "$image")
     read -r off kind length <<<"$line"
     echo "mount $image offset $off as $kind ($length bytes) on $point"
+    if [[ "$kind" == "super" ]]; then
+        extract_logical_system "$image" "$off" /tmp/logical-system.img
+        file /tmp/logical-system.img || true
+        if ! sudo mount -o ro,loop /tmp/logical-system.img "$point"; then
+            echo "read-only mount failed; clearing shared_blocks so debugfs can read it" >&2
+            e2fsck -fy -E unshare_blocks /tmp/logical-system.img || true
+            sudo mount -o ro,loop /tmp/logical-system.img "$point"
+        fi
+        return 0
+    fi
     fs="$image"
     if [[ "$kind" == "sparse" ]]; then
         unsparse_at "$image" "$off" /tmp/part.raw
