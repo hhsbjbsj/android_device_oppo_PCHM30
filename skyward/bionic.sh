@@ -299,13 +299,14 @@ copy_tree_entry() {
     if [[ -L "$src" ]]; then
         local target resolved=""
         target=$(readlink "$src")
-        case "$target" in
-            linker64|/system/bin/linker64|../bin/linker64|bin/linker64)
-                ln -sfn "$target" "$dst"
-                echo "link $(basename "$src") -> $target"
-                return 0
-                ;;
-        esac
+        # libdl.so is the linker. In the ramdisk that is ../bin/linker64.
+        # The interpreter itself has to be the real ELF, not a symlink into
+        # /apex, because the ramdisk does not contain the apex tree.
+        if [[ "$target" == *linker64 && "$(basename "$dst")" != "linker64" ]]; then
+            ln -sfn ../bin/linker64 "$dst"
+            echo "link $(basename "$src") -> ../bin/linker64"
+            return 0
+        fi
         if [[ "$target" == /* ]]; then
             if [[ -n "$SYSROOT" && -e "$SYSROOT$target" ]]; then
                 resolved="$SYSROOT$target"
@@ -456,10 +457,12 @@ if [[ ! -f "$DEST/linker64" || ! -e "$DEST/libc.so" ]]; then
             find "$SYSROOT" -name 'linker*' | head >&2 || true
             exit 1
         fi
+        echo "linker entry: $(readlink "$LINKER" || echo regular) at $LINKER"
+        # Android 11's linker64 is a symlink into the runtime apex. Mount
+        # that apex before following the link.
+        mount_runtime_apex || echo "runtime apex not mounted; trying lib64 as shipped"
         copy_tree_entry "$LINKER" "$DEST/linker64"
         chmod 755 "$DEST/linker64"
-        # libc on Android 11 is inside the runtime apex, not a plain file in lib64.
-        mount_runtime_apex || echo "runtime apex not mounted; trying lib64 as shipped"
         for lib in libc.so libm.so libdl.so liblog.so libunwind.so libc++.so libstdc++.so; do
             take_lib "$lib" || echo "no $lib in the image"
         done
